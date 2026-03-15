@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import torch
 from torch.cuda import amp
 from torch_ema import ExponentialMovingAverage
+from tqdm import tqdm
 from heatmap_loader import heatmap_dataloader
 from KeyRe_ID_model import KeyRe_ID
 from Loss_fun import make_loss
@@ -76,7 +77,7 @@ def test(model, queryloader, galleryloader, pool='avg', use_gpu=True):
             
             qf.append(features)
             q_pids.append(pids)
-            q_camids.extend(camids)
+            q_camids.append(camids[0])
 
         qf = torch.stack(qf)
         q_pids = np.asarray(q_pids)
@@ -99,7 +100,7 @@ def test(model, queryloader, galleryloader, pool='avg', use_gpu=True):
 
             gf.append(features)
             g_pids.append(pids)
-            g_camids.extend(camids)
+            g_camids.append(camids[0])
     gf = torch.stack(gf)
     g_pids = np.asarray(g_pids)
     g_camids = np.asarray(g_camids)
@@ -173,6 +174,7 @@ if __name__ == '__main__':
     cmc_rank1 = 0
     map = 0
     loss_history = []
+    os.makedirs('./loss', exist_ok=True)
     loss_log_path = "./loss/loss_log_best.txt"
     loss_graph_path = "./loss/loss_plot_best.png"
 
@@ -183,7 +185,14 @@ if __name__ == '__main__':
         scheduler.step(epoch)
         model.train()
 
-        for Epoch_n, (imgs, heatmaps, pid, target_cam, erasing_labels) in enumerate(heatmap_train_loader):
+        progress_bar = tqdm(
+            enumerate(heatmap_train_loader),
+            total=len(heatmap_train_loader),
+            desc=f"Epoch {epoch}/{epochs}",
+            leave=False,
+        )
+
+        for Epoch_n, (imgs, heatmaps, pid, target_cam, erasing_labels) in progress_bar:
             optimizer.zero_grad()
             optimizer_center.zero_grad()
             
@@ -218,6 +227,11 @@ if __name__ == '__main__':
 
             loss_meter.update(loss.item(), imgs.shape[0])
             acc_meter.update(acc, 1)
+            progress_bar.set_postfix(
+                loss=f"{loss_meter.avg:.3f}",
+                acc=f"{acc_meter.avg:.3f}",
+                lr=f"{scheduler._get_lr(epoch)[0]:.2e}",
+            )
 
             # ---- Logging Loss ----
             loss_history.append(loss.item())
@@ -228,6 +242,14 @@ if __name__ == '__main__':
             torch.cuda.synchronize()
             if (Epoch_n+1) % 400 == 0:
                 print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(epoch, (Epoch_n+1), len(heatmap_train_loader), loss_meter.avg, acc_meter.avg, scheduler._get_lr(epoch)[0]))
+
+        print("Epoch[{}] completed in {:.1f}s Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(
+            epoch,
+            time.time() - start_time,
+            loss_meter.avg,
+            acc_meter.avg,
+            scheduler._get_lr(epoch)[0],
+        ))
 
         # ---- Evaluation every 10 epochs ----
         if epoch % 10 == 0:

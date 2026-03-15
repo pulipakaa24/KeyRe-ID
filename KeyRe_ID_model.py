@@ -65,7 +65,7 @@ class KeyRe_ID(nn.Module):
         # state_dict = torch.load(pretrainpath, map_location='cpu')
         # self.base.load_param(state_dict,load=True)
         if pretrainpath:
-            state_dict = torch.load(pretrainpath, map_location='cpu')
+            state_dict = torch.load(pretrainpath, map_location='cpu', weights_only=False)
             self.base.load_param(state_dict, load=True)
         
         #-------------------Global Branch-------------
@@ -240,7 +240,7 @@ class KeyRe_ID(nn.Module):
     def load_param(self, trained_path, load=False):
         print("Run load_param")
         if not load:
-            param_dict = torch.load(trained_path, map_location='cpu')
+            param_dict = torch.load(trained_path, map_location='cpu', weights_only=False)
         else:
             param_dict = trained_path
 

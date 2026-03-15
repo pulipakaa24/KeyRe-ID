@@ -244,7 +244,7 @@ class TransReID(nn.Module):
     def load_param(self, model_path, load=False):
         print("Run load_param")
         if not load:
-            param_dict = torch.load(model_path, map_location='cpu')
+            param_dict = torch.load(model_path, map_location='cpu', weights_only=False)
         else:
             param_dict = model_path
 

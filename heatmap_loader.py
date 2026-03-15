@@ -18,6 +18,38 @@ __factory = {
     'iLIDSVID':iLIDSVID
 }
 
+# ─── Helper: resolve image path → heatmap path ───
+def _resolve_heatmap_path(frame_path, heatmap_root):
+    """
+    Given an image frame path and a heatmap root directory,
+    return the corresponding .npy heatmap file path.
+
+    Handles both:
+      - MARS:      .../bbox_train/personID/tracklet/frame.jpg
+      - iLIDS-VID: .../sequences/cam1/personID/frame.png
+
+    For iLIDS-VID, heatmaps are stored as:
+      heatmap_root/cam1/personID/frame.npy
+
+    For MARS, heatmaps are stored as:
+      heatmap_root/personID/frame.npy
+    """
+    basename = os.path.basename(frame_path)
+    # Strip any image extension → .npy
+    name_no_ext = os.path.splitext(basename)[0]
+    npy_name = name_no_ext + ".npy"
+
+    parent = os.path.dirname(frame_path)
+    person_id = os.path.basename(parent)
+    grandparent = os.path.basename(os.path.dirname(parent))
+
+    # If grandparent is cam1 or cam2, include it in the path (iLIDS-VID)
+    if grandparent in ('cam1', 'cam2'):
+        return os.path.join(heatmap_root, grandparent, person_id, npy_name)
+    else:
+        return os.path.join(heatmap_root, person_id, npy_name)
+
+
 # Heatmap Preprocessing transform 
 class HeatmapResize(object):
     def __init__(self, size):
@@ -61,8 +93,16 @@ def val_collate_fn(batch):
 def heatmap_dataloader(Dataset_name, dataset_root):
     dataset_subdir = Dataset_name
     dataset_path = os.path.join(dataset_root, dataset_subdir)
-    heatmap_train_root = os.path.join(dataset_path, 'heatmap', 'bbox_train')
-    heatmap_test_root  = os.path.join(dataset_path, 'heatmap', 'bbox_test')
+
+    # ─── Dataset-specific heatmap roots ───
+    if Dataset_name == 'iLIDSVID':
+        # iLIDS-VID: single heatmap root (train/test share same images, split by person ID)
+        heatmap_train_root = os.path.join(dataset_path, 'heatmap')
+        heatmap_test_root  = os.path.join(dataset_path, 'heatmap')
+    else:
+        # MARS: separate bbox_train / bbox_test
+        heatmap_train_root = os.path.join(dataset_path, 'heatmap', 'bbox_train')
+        heatmap_test_root  = os.path.join(dataset_path, 'heatmap', 'bbox_test')
     
     val_transforms = T.Compose([
         T.Resize([256, 128], interpolation=InterpolationMode.BILINEAR),
@@ -129,17 +169,31 @@ class Heatmap_Dataset(VideoDataset):
         
         # imgs shape: [clips, seq_len, 3, H, W]
         clips, seq_len = imgs.shape[0], imgs.shape[1]
+
+        # Reconstruct the frame indices used by VideoDataset to match
+        # heatmaps to the exact frames shown in each clip (including
+        # repeated frames in the last clip).
+        num = len(img_paths)
+        cur_index = 0
+        frame_indices = list(range(num))
+        indices_list = []
+        while num - cur_index > self.seq_len:
+            indices_list.append(frame_indices[cur_index:cur_index + self.seq_len])
+            cur_index += self.seq_len
+        last_seq = frame_indices[cur_index:]
+        for idx in last_seq:
+            if len(last_seq) >= self.seq_len:
+                break
+            last_seq.append(idx)
+        indices_list.append(last_seq)
+        indices_list = indices_list[:clips]  # respect max_length truncation
         
         heatmap_list = []
-        for i in range(clips):
+        for i, clip_indices in enumerate(indices_list):
             clip_heatmaps = []
-            # Calculate indices for img_paths corresponding to each clip
-            start_idx = i*seq_len
-            end_idx = min(start_idx+seq_len, len(img_paths))
-            for frame_path in img_paths[start_idx:end_idx]:
-                file_name = os.path.basename(frame_path).replace(".jpg", ".npy")
-                person_id = os.path.basename(os.path.dirname(frame_path))
-                heatmap_file = os.path.join(self.heatmap_root, person_id, file_name)
+            for frame_idx in clip_indices:
+                frame_path = img_paths[frame_idx]
+                heatmap_file = _resolve_heatmap_path(frame_path, self.heatmap_root)
 
                 if not os.path.exists(heatmap_file):
                     print(f"⚠️ Heatmap file not found: {heatmap_file}")
@@ -148,30 +202,13 @@ class Heatmap_Dataset(VideoDataset):
                     heatmap_np = np.load(heatmap_file)  # shape: (6, H, W)
                     heatmap = torch.tensor(heatmap_np, dtype=torch.float32)
 
-                # Normalize per channel
-                for c in range(heatmap.shape[0]):
-                    max_val = heatmap[c].max()
-                    if max_val > 0:
-                        heatmap[c] = heatmap[c] / max_val
-                    else:
-                        heatmap[c] = torch.zeros_like(heatmap[c])  # Explicitly set to 0
-
-                # Apply transform
+                # Apply transform (includes resize, min-max scaling, normalize)
                 if self.heatmap_transform is not None:
                     heatmap = self.heatmap_transform(heatmap)
-                    if heatmap.shape[1:] != self.heatmap_transform.size:
-                        heatmap = T.Resize(self.heatmap_transform.size)(heatmap)
                 
                 clip_heatmaps.append(heatmap)
             
-            # Pad if the number of frames in the clip is less than seq_len
-            pad_size = seq_len - len(clip_heatmaps)
-            if pad_size > 0:
-                padding = torch.zeros(pad_size, *clip_heatmaps[0].shape)
-                clip_heatmaps = torch.cat([torch.stack(clip_heatmaps), padding], dim=0)
-            else:
-                clip_heatmaps = torch.stack(clip_heatmaps)
-            
+            clip_heatmaps = torch.stack(clip_heatmaps)
             heatmap_list.append(clip_heatmaps)
         
         heatmaps = torch.stack(heatmap_list, dim=0)  # [clips, seq_len, 6, H, W]
@@ -189,9 +226,7 @@ class Heatmap_Dataset_inderase(VideoDataset_inderase):
 
     def load_heatmap(self, img_path):
         if img_path not in self.heatmap_cache:
-            file_name = os.path.basename(img_path).replace(".jpg", ".npy")
-            person_id = os.path.basename(os.path.dirname(img_path))
-            heatmap_file = os.path.join(self.heatmap_root, person_id, file_name)
+            heatmap_file = _resolve_heatmap_path(img_path, self.heatmap_root)
 
             # Raise error if file does not exist
             if not os.path.exists(heatmap_file):
